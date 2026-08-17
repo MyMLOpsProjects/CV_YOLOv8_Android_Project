@@ -1,0 +1,2 @@
+# CV_YOLOv8_Android_Project
+CV_YOLOv8_Android_Project
