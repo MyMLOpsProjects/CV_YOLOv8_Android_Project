@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">YOLO Object Detection</string>
+    <string name="inference_time">Inference: %1$dms</string>
+</resources>
