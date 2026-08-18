@@ -42,12 +42,12 @@ class MainActivity : AppCompatActivity(), YoloDetector.DetectorListener {
             requestPermissionLauncher.launch(Manifest.permission.CAMERA)
         }
 
-        detector = YoloDetector(this, "yolov8n_int8.tflite", "labels.txt", this)
+        detector = YoloDetector(this, "yolov8n-seg_int8.tflite", "labels.txt", this)
         try {
             detector?.setup()
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             Log.e("MainActivity", "Failed to setup detector", e)
-            Toast.makeText(this, "Place labels.txt and yolov8n.tflite in assets", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "Error initializing detector: ${e.message}", Toast.LENGTH_LONG).show()
         }
     }
 

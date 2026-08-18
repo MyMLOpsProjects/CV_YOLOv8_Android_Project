@@ -11,5 +11,8 @@ data class BoundingBox(
     val h: Float,
     val cnf: Float,
     val cls: Int,
-    val clsName: String
+    val clsName: String,
+    val mask: FloatArray? = null,
+    val mWidth: Int = 0,
+    val mHeight: Int = 0
 )

@@ -34,17 +34,23 @@ class YoloDetector(
     private var tensorHeight = 640
     private var numChannel = 0
     private var numElements = 0
+    
+    private var isSegmentation = false
+    private var numMasks = 32
+    private var maskWidth = 160
+    private var maskHeight = 160
 
     private var inputBuffer: ByteBuffer? = null
-    private var outputBuffer: ByteBuffer? = null
+    private var outputBuffer0: ByteBuffer? = null
+    private var outputBuffer1: ByteBuffer? = null
     
-    // Arrays for transposition
-    private var hwcArray: FloatArray? = null
-    private var chwArray: FloatArray? = null
     private var hwcByteArray: ByteArray? = null
     private var chwByteArray: ByteArray? = null
+    private var hwcArray: FloatArray? = null
+    private var chwArray: FloatArray? = null
     
-    private var outputArray: FloatArray? = null
+    private var outputArray0: FloatArray? = null
+    private var outputArray1: FloatArray? = null
 
     private var imageProcessor: ImageProcessor? = null
     private var isQuantized = false
@@ -56,8 +62,7 @@ class YoloDetector(
         try {
             val compatList = CompatibilityList()
             if (compatList.isDelegateSupportedOnThisDevice) {
-                val delegateOptions = compatList.bestOptionsForThisDevice
-                gpuDelegate = GpuDelegate(delegateOptions)
+                gpuDelegate = GpuDelegate()
                 options.addDelegate(gpuDelegate)
                 Log.d("YoloDetector", "GPU acceleration enabled")
             } else {
@@ -76,21 +81,18 @@ class YoloDetector(
         interpreter = interp
 
         val inputTensor = interp.getInputTensor(0)
-        val outputTensor = interp.getOutputTensor(0)
-        
         val inputShape = inputTensor.shape()
-        val outputShape = outputTensor.shape()
-        
         isQuantized = inputTensor.dataType() == DataType.UINT8 || inputTensor.dataType() == DataType.INT8
 
+        // Detect if it's a segmentation model by checking number of outputs
+        isSegmentation = interp.outputTensorCount > 1
+
         if (inputShape[1] == 3) {
-            // NCHW
             tensorWidth = inputShape[3]
             tensorHeight = inputShape[2]
             val totalSize = 3 * tensorHeight * tensorWidth
             val elementSize = if (isQuantized) 1 else 4
             inputBuffer = ByteBuffer.allocateDirect(totalSize * elementSize).order(ByteOrder.nativeOrder())
-            
             if (isQuantized) {
                 hwcByteArray = ByteArray(totalSize)
                 chwByteArray = ByteArray(totalSize)
@@ -99,26 +101,34 @@ class YoloDetector(
                 chwArray = FloatArray(totalSize)
             }
         } else {
-            // NHWC
             tensorWidth = inputShape[2]
             tensorHeight = inputShape[1]
         }
 
-        numChannel = outputShape[1]
-        numElements = outputShape[2]
-        
-        // Output for YOLOv8 is typically Float32 even if input is quantized (dequantize layer)
-        outputBuffer = ByteBuffer.allocateDirect(1 * numChannel * numElements * 4).order(ByteOrder.nativeOrder())
-        outputArray = FloatArray(numChannel * numElements)
+        // Output 0: Detections [1, 4+num_classes+32, 8400]
+        val outputTensor0 = interp.getOutputTensor(0)
+        val outputShape0 = outputTensor0.shape()
+        numChannel = outputShape0[1]
+        numElements = outputShape0[2]
+        outputBuffer0 = ByteBuffer.allocateDirect(numChannel * numElements * 4).order(ByteOrder.nativeOrder())
+        outputArray0 = FloatArray(numChannel * numElements)
+
+        if (isSegmentation) {
+            // Output 1: Proto masks [1, 32, 160, 160]
+            val outputTensor1 = interp.getOutputTensor(1)
+            val outputShape1 = outputTensor1.shape()
+            numMasks = outputShape1[1]
+            maskHeight = outputShape1[2]
+            maskWidth = outputShape1[3]
+            outputBuffer1 = ByteBuffer.allocateDirect(numMasks * maskHeight * maskWidth * 4).order(ByteOrder.nativeOrder())
+            outputArray1 = FloatArray(numMasks * maskHeight * maskWidth)
+        }
 
         val processorBuilder = ImageProcessor.Builder()
             .add(ResizeOp(tensorHeight, tensorWidth, ResizeOp.ResizeMethod.BILINEAR))
-            
         if (isQuantized) {
-            // For INT8, we keep values as 0..255 (UINT8)
             processorBuilder.add(CastOp(DataType.UINT8))
         } else {
-            // For Float32, we normalize to 0..1
             processorBuilder.add(NormalizeOp(0f, 255f))
             processorBuilder.add(CastOp(DataType.FLOAT32))
         }
@@ -133,15 +143,13 @@ class YoloDetector(
         }
         reader.close()
         inputStream.close()
-        
-        Log.d("YoloDetector", "Setup complete. Quantized: $isQuantized, Input: ${inputShape.contentToString()}")
     }
 
     fun detect(frame: Bitmap) {
         val interp = interpreter ?: return
         val processor = imageProcessor ?: return
-        val outBuffer = outputBuffer ?: return
-        val outArray = outputArray ?: return
+        val outBuf0 = outputBuffer0 ?: return
+        val outArr0 = outputArray0 ?: return
 
         val startTime = SystemClock.uptimeMillis()
 
@@ -154,18 +162,15 @@ class YoloDetector(
                 val byteBuffer = processedImage.buffer
                 byteBuffer.rewind()
                 byteBuffer.get(hwcByteArray!!)
-                
                 val hwc = hwcByteArray!!
                 val chw = chwByteArray!!
                 val imgSize = tensorHeight * tensorWidth
-                
                 var hwcIdx = 0
                 for (i in 0 until imgSize) {
                     chw[i] = hwc[hwcIdx++]
                     chw[imgSize + i] = hwc[hwcIdx++]
                     chw[2 * imgSize + i] = hwc[hwcIdx++]
                 }
-                
                 inputBuffer!!.rewind()
                 inputBuffer!!.put(chw)
                 inputBuffer!!
@@ -173,18 +178,15 @@ class YoloDetector(
                 val floatBuffer = processedImage.buffer.asFloatBuffer()
                 floatBuffer.rewind()
                 floatBuffer.get(hwcArray!!)
-                
                 val hwc = hwcArray!!
                 val chw = chwArray!!
                 val imgSize = tensorHeight * tensorWidth
-                
                 var hwcIdx = 0
                 for (i in 0 until imgSize) {
                     chw[i] = hwc[hwcIdx++]
                     chw[imgSize + i] = hwc[hwcIdx++]
                     chw[2 * imgSize + i] = hwc[hwcIdx++]
                 }
-                
                 inputBuffer!!.rewind()
                 inputBuffer!!.asFloatBuffer().put(chw)
                 inputBuffer!!
@@ -193,13 +195,24 @@ class YoloDetector(
             processedImage.buffer
         }
 
-        outBuffer.rewind()
-        interp.run(runInput, outBuffer)
+        val outputs = mutableMapOf<Int, Any>(0 to outBuf0)
+        if (isSegmentation) {
+            outputs[1] = outputBuffer1!!
+        }
 
-        outBuffer.rewind()
-        outBuffer.asFloatBuffer().get(outArray)
+        outBuf0.rewind()
+        outputBuffer1?.rewind()
+        interp.runForMultipleInputsOutputs(arrayOf(runInput), outputs)
 
-        val bestBoxes = bestBox(outArray)
+        outBuf0.rewind()
+        outBuf0.asFloatBuffer().get(outArr0)
+        
+        if (isSegmentation) {
+            outputBuffer1!!.rewind()
+            outputBuffer1!!.asFloatBuffer().get(outputArray1!!)
+        }
+
+        val bestBoxes = bestBox(outArr0)
         val totalTime = SystemClock.uptimeMillis() - startTime
 
         if (bestBoxes == null) {
@@ -212,19 +225,18 @@ class YoloDetector(
 
     private fun bestBox(array: FloatArray): List<BoundingBox>? {
         val boundingBoxes = mutableListOf<BoundingBox>()
+        val numClasses = labels.size
 
         for (c in 0 until numElements) {
             var maxConf = CONFIDENCE_THRESHOLD
             var maxIdx = -1
             
-            var classOffset = c + (numElements * 4)
-            for (j in 4 until numChannel) {
-                val conf = array[classOffset]
+            for (j in 0 until numClasses) {
+                val conf = array[c + (numElements * (j + 4))]
                 if (conf > maxConf) {
                     maxConf = conf
-                    maxIdx = j - 4
+                    maxIdx = j
                 }
-                classOffset += numElements
             }
 
             if (maxIdx != -1) {
@@ -233,6 +245,7 @@ class YoloDetector(
                 var w = array[c + (numElements * 2)]
                 var h = array[c + (numElements * 3)]
 
+                // Always normalize coordinates
                 if (cx > 2f || w > 2f) {
                     cx /= tensorWidth
                     cy /= tensorHeight
@@ -245,13 +258,26 @@ class YoloDetector(
                 val x2 = cx + (w / 2f)
                 val y2 = cy + (h / 2f)
 
-                if (x1 < -0.1f || x1 > 1.1f) continue
+                if (x1 < -0.1f || x1 > 1.1f || y1 < -0.1f || y1 > 1.1f) continue
+
+                var maskCoeffs: FloatArray? = null
+                if (isSegmentation) {
+                    maskCoeffs = FloatArray(numMasks)
+                    for (i in 0 until numMasks) {
+                        maskCoeffs[i] = array[c + (numElements * (numClasses + 4 + i))]
+                    }
+                }
+
+                val maskData = if (isSegmentation) processMask(maskCoeffs!!, x1, y1, x2, y2) else null
 
                 boundingBoxes.add(
                     BoundingBox(
                         x1 = x1, y1 = y1, x2 = x2, y2 = y2,
                         cx = cx, cy = cy, w = w, h = h,
-                        cnf = maxConf, cls = maxIdx, clsName = labels.getOrNull(maxIdx) ?: "unknown"
+                        cnf = maxConf, cls = maxIdx, clsName = labels.getOrNull(maxIdx) ?: "unknown",
+                        mask = maskData?.first,
+                        mWidth = maskData?.second ?: 0,
+                        mHeight = maskData?.third ?: 0
                     )
                 )
             }
@@ -261,6 +287,40 @@ class YoloDetector(
 
         return applyNMS(boundingBoxes)
     }
+
+    private fun processMask(coeffs: FloatArray, x1: Float, y1: Float, x2: Float, y2: Float): Triple<FloatArray, Int, Int> {
+        val proto = outputArray1!!
+        val maskSize = maskHeight * maskWidth
+        
+        val mx1 = (x1 * maskWidth).toInt().coerceIn(0, maskWidth - 1)
+        val my1 = (y1 * maskHeight).toInt().coerceIn(0, maskHeight - 1)
+        val mx2 = (x2 * maskWidth).toInt().coerceIn(0, maskWidth - 1)
+        val my2 = (y2 * maskHeight).toInt().coerceIn(0, maskHeight - 1)
+        
+        val cropWidth = mx2 - mx1 + 1
+        val cropHeight = my2 - my1 + 1
+        
+        if (cropWidth <= 0 || cropHeight <= 0) return Triple(FloatArray(0), 0, 0)
+        
+        val result = FloatArray(cropWidth * cropHeight)
+        
+        for (y in 0 until cropHeight) {
+            val maskY = my1 + y
+            for (x in 0 until cropWidth) {
+                val maskX = mx1 + x
+                val protoIdx = maskY * maskWidth + maskX
+                
+                var sum = 0f
+                for (j in 0 until numMasks) {
+                    sum += coeffs[j] * proto[j * maskSize + protoIdx]
+                }
+                result[y * cropWidth + x] = sigmoid(sum)
+            }
+        }
+        return Triple(result, cropWidth, cropHeight)
+    }
+
+    private fun sigmoid(x: Float): Float = 1f / (1f + Math.exp(-x.toDouble()).toFloat())
 
     private fun applyNMS(boxes: List<BoundingBox>): List<BoundingBox> {
         val sortedBoxes = boxes.sortedByDescending { it.cnf }.toMutableList()
