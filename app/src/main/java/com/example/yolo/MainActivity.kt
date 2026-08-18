@@ -42,7 +42,7 @@ class MainActivity : AppCompatActivity(), YoloDetector.DetectorListener {
             requestPermissionLauncher.launch(Manifest.permission.CAMERA)
         }
 
-        detector = YoloDetector(this, "yolov8n.tflite", "labels.txt", this)
+        detector = YoloDetector(this, "yolov8n_int8.tflite", "labels.txt", this)
         try {
             detector?.setup()
         } catch (e: Exception) {

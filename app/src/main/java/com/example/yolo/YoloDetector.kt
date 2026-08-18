@@ -37,11 +37,17 @@ class YoloDetector(
 
     private var inputBuffer: ByteBuffer? = null
     private var outputBuffer: ByteBuffer? = null
+    
+    // Arrays for transposition
     private var hwcArray: FloatArray? = null
     private var chwArray: FloatArray? = null
+    private var hwcByteArray: ByteArray? = null
+    private var chwByteArray: ByteArray? = null
+    
     private var outputArray: FloatArray? = null
 
     private var imageProcessor: ImageProcessor? = null
+    private var isQuantized = false
 
     fun setup() {
         val model = FileUtil.loadMappedFile(context, modelPath)
@@ -62,26 +68,38 @@ class YoloDetector(
             Log.e("YoloDetector", "Exception initializing GPU delegate", e)
             options.setNumThreads(4)
         } catch (e: Error) {
-            Log.e("YoloDetector", "Error initializing GPU delegate (Class not found?)", e)
+            Log.e("YoloDetector", "Error initializing GPU delegate", e)
             options.setNumThreads(4)
         }
         
         val interp = Interpreter(model, options)
         interpreter = interp
 
-        val inputShape = interp.getInputTensor(0).shape()
-        val outputShape = interp.getOutputTensor(0).shape()
+        val inputTensor = interp.getInputTensor(0)
+        val outputTensor = interp.getOutputTensor(0)
+        
+        val inputShape = inputTensor.shape()
+        val outputShape = outputTensor.shape()
+        
+        isQuantized = inputTensor.dataType() == DataType.UINT8 || inputTensor.dataType() == DataType.INT8
 
         if (inputShape[1] == 3) {
-            // NCHW [1, 3, 640, 640]
+            // NCHW
             tensorWidth = inputShape[3]
             tensorHeight = inputShape[2]
             val totalSize = 3 * tensorHeight * tensorWidth
-            inputBuffer = ByteBuffer.allocateDirect(totalSize * 4).order(ByteOrder.nativeOrder())
-            hwcArray = FloatArray(totalSize)
-            chwArray = FloatArray(totalSize)
+            val elementSize = if (isQuantized) 1 else 4
+            inputBuffer = ByteBuffer.allocateDirect(totalSize * elementSize).order(ByteOrder.nativeOrder())
+            
+            if (isQuantized) {
+                hwcByteArray = ByteArray(totalSize)
+                chwByteArray = ByteArray(totalSize)
+            } else {
+                hwcArray = FloatArray(totalSize)
+                chwArray = FloatArray(totalSize)
+            }
         } else {
-            // NHWC [1, 640, 640, 3]
+            // NHWC
             tensorWidth = inputShape[2]
             tensorHeight = inputShape[1]
         }
@@ -89,14 +107,22 @@ class YoloDetector(
         numChannel = outputShape[1]
         numElements = outputShape[2]
         
+        // Output for YOLOv8 is typically Float32 even if input is quantized (dequantize layer)
         outputBuffer = ByteBuffer.allocateDirect(1 * numChannel * numElements * 4).order(ByteOrder.nativeOrder())
         outputArray = FloatArray(numChannel * numElements)
 
-        imageProcessor = ImageProcessor.Builder()
+        val processorBuilder = ImageProcessor.Builder()
             .add(ResizeOp(tensorHeight, tensorWidth, ResizeOp.ResizeMethod.BILINEAR))
-            .add(NormalizeOp(0f, 255f))
-            .add(CastOp(DataType.FLOAT32))
-            .build()
+            
+        if (isQuantized) {
+            // For INT8, we keep values as 0..255 (UINT8)
+            processorBuilder.add(CastOp(DataType.UINT8))
+        } else {
+            // For Float32, we normalize to 0..1
+            processorBuilder.add(NormalizeOp(0f, 255f))
+            processorBuilder.add(CastOp(DataType.FLOAT32))
+        }
+        imageProcessor = processorBuilder.build()
 
         val inputStream = context.assets.open(labelPath)
         val reader = BufferedReader(InputStreamReader(inputStream))
@@ -107,50 +133,69 @@ class YoloDetector(
         }
         reader.close()
         inputStream.close()
+        
+        Log.d("YoloDetector", "Setup complete. Quantized: $isQuantized, Input: ${inputShape.contentToString()}")
     }
 
     fun detect(frame: Bitmap) {
         val interp = interpreter ?: return
-        val outBuffer = outputBuffer ?: return
         val processor = imageProcessor ?: return
+        val outBuffer = outputBuffer ?: return
         val outArray = outputArray ?: return
 
         val startTime = SystemClock.uptimeMillis()
 
-        // 1. Preprocessing
-        val tensorImage = TensorImage(DataType.FLOAT32)
+        val tensorImage = TensorImage(if (isQuantized) DataType.UINT8 else DataType.FLOAT32)
         tensorImage.load(frame)
         val processedImage = processor.process(tensorImage)
 
         val runInput = if (inputBuffer != null) {
-            val srcBuffer = processedImage.buffer.asFloatBuffer()
-            srcBuffer.rewind()
-            srcBuffer.get(hwcArray!!)
-            
-            val hwc = hwcArray!!
-            val chw = chwArray!!
-            val imgSize = tensorHeight * tensorWidth
-            
-            // Highly optimized sequential transposition
-            var hwcIdx = 0
-            for (i in 0 until imgSize) {
-                chw[i] = hwc[hwcIdx++]
-                chw[imgSize + i] = hwc[hwcIdx++]
-                chw[2 * imgSize + i] = hwc[hwcIdx++]
+            if (isQuantized) {
+                val byteBuffer = processedImage.buffer
+                byteBuffer.rewind()
+                byteBuffer.get(hwcByteArray!!)
+                
+                val hwc = hwcByteArray!!
+                val chw = chwByteArray!!
+                val imgSize = tensorHeight * tensorWidth
+                
+                var hwcIdx = 0
+                for (i in 0 until imgSize) {
+                    chw[i] = hwc[hwcIdx++]
+                    chw[imgSize + i] = hwc[hwcIdx++]
+                    chw[2 * imgSize + i] = hwc[hwcIdx++]
+                }
+                
+                inputBuffer!!.rewind()
+                inputBuffer!!.put(chw)
+                inputBuffer!!
+            } else {
+                val floatBuffer = processedImage.buffer.asFloatBuffer()
+                floatBuffer.rewind()
+                floatBuffer.get(hwcArray!!)
+                
+                val hwc = hwcArray!!
+                val chw = chwArray!!
+                val imgSize = tensorHeight * tensorWidth
+                
+                var hwcIdx = 0
+                for (i in 0 until imgSize) {
+                    chw[i] = hwc[hwcIdx++]
+                    chw[imgSize + i] = hwc[hwcIdx++]
+                    chw[2 * imgSize + i] = hwc[hwcIdx++]
+                }
+                
+                inputBuffer!!.rewind()
+                inputBuffer!!.asFloatBuffer().put(chw)
+                inputBuffer!!
             }
-            
-            inputBuffer!!.rewind()
-            inputBuffer!!.asFloatBuffer().put(chw)
-            inputBuffer!!
         } else {
             processedImage.buffer
         }
 
-        // 2. Inference
         outBuffer.rewind()
         interp.run(runInput, outBuffer)
 
-        // 3. Postprocessing
         outBuffer.rewind()
         outBuffer.asFloatBuffer().get(outArray)
 
@@ -188,7 +233,6 @@ class YoloDetector(
                 var w = array[c + (numElements * 2)]
                 var h = array[c + (numElements * 3)]
 
-                // YOLOv8 TFLite outputs are often in pixels (0..640)
                 if (cx > 2f || w > 2f) {
                     cx /= tensorWidth
                     cy /= tensorHeight

@@ -17,6 +17,7 @@ A real-time object detection application for Android using the **YOLOv8 Nano** m
 | :--- | :--- | :--- |
 | YOLOv8n (Float32) | CPU (4 threads) | ~150ms - 200ms |
 | YOLOv8n (Float32) | **GPU Delegate** | **< 50ms** |
+| YOLOv8n (INT8) | **CPU/GPU** | **~10ms - 30ms** |
 
 *Note: Performance results based on modern Android hardware.*
 
@@ -32,7 +33,7 @@ A real-time object detection application for Android using the **YOLOv8 Nano** m
    git clone <your-repo-url>
    ```
 2. **Add Model Assets**:
-   - Ensure `yolov8n.tflite` and `labels.txt` are present in `app/src/main/assets`.
+   - Ensure `yolov8n_int8.tflite` (for performance) or `yolov8n.tflite` and `labels.txt` are present in `app/src/main/assets`.
 3. **Build and Run**:
    - Open the project in Android Studio.
    - Sync Gradle.
@@ -43,12 +44,12 @@ A real-time object detection application for Android using the **YOLOv8 Nano** m
 - **Language**: 100% Kotlin
 - **ML Framework**: TensorFlow Lite (org.tensorflow:tensorflow-lite)
 - **Camera API**: Jetpack CameraX
-- **Optimization**: Sequential array transposition for planar data handling.
+- **Optimization**: Sequential array transposition for planar data handling. Supports both **Float32** and **INT8 Quantized** models automatically.
 
 ## 📅 Roadmap
 - [x] Migrate from ONNX to TFLite.
 - [x] Enable GPU hardware acceleration.
-- [ ] Implement INT8 Quantized model support for further speedup.
+- [x] Implement INT8 Quantized model support for further speedup.
 - [ ] Add support for custom model loading from external storage.
 
 ---
